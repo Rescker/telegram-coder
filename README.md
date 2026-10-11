@@ -108,6 +108,8 @@ snapshots.
 |photo|goes as an image to the model (the caption becomes the text)|
 |`.txt`/`.md` document ≤ 64 KB|content becomes the prompt text|
 |`/status`|model, thinking, session file, messages, context, state, mode|
+|`/plan [task]`|turns on **plan mode**: investigates and proposes steps only|
+|`/aprovar`|implements the proposed plan (back to normal mode)|
 |`/ask [question]`|turns on **read-only mode** (or asks in it right away)|
 |`/work`|back to normal mode|
 |`/stop`|aborts the turn|
@@ -174,11 +176,40 @@ With `OMP_CWD` pointing at an empty folder and `run.bat` running:
 |8|`/new` then `/name test` then `/sessions`|New session created, `test` in the list with `✅`; tapping the other session brings the history back|
 |9|`/model flash` and tap one|Model keyboard; `/status` confirms the new `provider/id`|
 |10|`/thinking high`|`🧠 thinking: high` and `/status` confirms|
-|11|Send a photo|The agent describes the image|
-|12|Send a small `.md`|The agent receives the content as text|
-|13|`Ctrl+C` in the bridge and `run.bat` again|No old message is reprocessed|
+|11|`/plan create a file notas.md with hello`|Mode `📋 plano`; the agent only investigates and proposes steps; `notas.md` is **not** created|
+|12|`/aprovar`|The work agent implements the plan; `notas.md` appears|
+|13|`/ask what is in this repo?`|Read-only answer; `/status` shows `🔍 ask`|
+|14|Send a photo|The agent describes the image|
+|15|Send a small `.md`|The agent receives the content as text|
+|16|`Ctrl+C` in the bridge and `run.bat` again|No old message is reprocessed|
 
 If something hangs, `data/bridge.log` and `data/omp-stderr.log` show what happened.
+
+## `/plan` mode (propose only)
+
+`/plan` uses the same read-only process as `/ask` (so nothing can be touched) plus a planning instruction, and remembers the plan so you can approve it:
+
+- `/plan` — turns the mode on
+- `/plan rename dobro to triplo and fix the callers` — turns it on and plans right away
+- `/aprovar` — sends the plan back to the work agent, which implements it in normal mode
+- `/work` — leaves the mode and discards the plan
+
+`omp`'s own plan mode is not reachable from RPC: it is a TUI toggle (`Alt+Shift+P`), `plan.defaultOnStartup` is ignored over RPC (verified: a `--config` overlay setting it still let `write` through), and `--plan-yolo` engages it but auto-approves the plan, which defeats the review. So the bridge implements the equivalent with what *is* enforceable — the read-only tool list — and the approval step is yours, in the chat.
+
+The plan the agent registers with the `todo` tool gets its own message, updated in place as steps complete:
+
+```
+📋 plano · 1/3
+
+1. Rename in util.py
+  ✅ Rename `dobro` to `triplo`
+  🔄 Run the tests
+
+2. Update callers
+  ⬜ Map every usage with grep
+```
+
+Before, that frame was rendered as `🔧 todo: {"op": "create", ...}` — a wall of raw JSON. The plan itself lives in its own message; the summary only counts the `todo` call (`todo ×1`), never its arguments.
 
 ## `/ask` mode (read-only)
 
