@@ -45,6 +45,8 @@ log = logging.getLogger(__name__)
 
 HELP_TEXT = """Comandos:
 /status — modelo, sessão, contexto, modo
+/plan [tarefa] — modo plano: só investiga e propõe etapas, sem tocar em nada
+/aprovar — implementa o plano proposto (volta ao modo normal)
 /ask [pergunta] — modo só leitura e pesquisa (não escreve nem executa)
 /work — volta ao modo normal
 /stop — aborta o turno atual
@@ -72,6 +74,18 @@ PENDING_UI_LIMIT = 50
 # Ferramentas do modo /ask: leitura e pesquisa, nenhuma escrita/execução.
 # `--tools=` é enforçado pelo próprio omp (verificado: write/edit/bash indisponíveis).
 ASK_TOOLS = "read,glob,grep,web_search,lsp"
+# O modo plano do omp é um toggle da TUI (Alt+Shift+P) e `plan.defaultOnStartup`
+# é ignorado no RPC (verificado); `--plan-yolo` engata mas auto-aprova o plano,
+# o que anula a revisão. Então o /plan do bridge usa o que É enforçável: as
+# mesmas ferramentas somente-leitura, mais uma instrução de planejar.
+PLAN_TOOLS = ASK_TOOLS
+PLAN_INSTRUCTION = (
+    "MODO PLANO. Não altere nenhum arquivo, não execute comandos e não crie "
+    "nada: você está somente leitura. Investigue o necessário (read/glob/grep) "
+    "e responda com um plano de implementação em etapas numeradas, dizendo para "
+    "cada etapa os arquivos afetados e como verificar o resultado. Registre as "
+    "etapas com a ferramenta todo. Não implemente nada agora.\n\nTarefa: "
+)
 
 
 class Bridge:
@@ -92,6 +106,10 @@ class Bridge:
         # sessões separadas, para o agente não poder tocar no projeto.
         self.ask_client: OmpRpcClient | None = None
         self.ask_mode = False
+        # Modo plano: mesmo cliente somente-leitura, com instrução de planejar e
+        # aprovação que devolve o plano ao agente que executa.
+        self.plan_mode = False
+        self.pending_plan: str | None = None
         self._ask_task: asyncio.Task[None] | None = None
 
         self.streamer: TurnStreamer | None = None
@@ -118,7 +136,7 @@ class Bridge:
         return self.config.data_dir / "ask-sessions"
 
     async def _ensure_ask_client(self) -> OmpRpcClient:
-        """Sobe o filho somente-leitura na primeira vez que /ask é usado."""
+        """Sobe o filho somente-leitura na primeira vez que é usado."""
         if self.ask_client is not None and self.ask_client.running:
             return self.ask_client
         client = OmpRpcClient(
@@ -135,16 +153,26 @@ class Bridge:
         self._ask_task = asyncio.create_task(
             self._event_loop(client), name="events-ask"
         )
-        log.info("modo ask: omp somente-leitura iniciado (%s)", ASK_TOOLS)
+        log.info("modo somente-leitura: omp iniciado (%s)", ASK_TOOLS)
         return client
 
-    async def _set_ask_mode(self, enabled: bool) -> None:
-        if enabled == self.ask_mode:
+    async def _set_ask_mode(self, enabled: bool, *, plan: bool = False) -> None:
+        if enabled == self.ask_mode and (not enabled or plan == self.plan_mode):
             return
+        # Um turno em curso pertence ao modo que estamos deixando: sem abortá-lo,
+        # o próximo prompt entraria como steer e rodaria com as ferramentas
+        # antigas, misturado ao trabalho anterior.
+        previous = self._active_client()
+        with contextlib.suppress(OmpError, TimeoutError):
+            state = await self._state_for(previous)
+            if state.get("isStreaming"):
+                log.info("modo mudando: abortando o turno em curso")
+                await previous.request({"type": "abort"}, timeout=30)
+        await self._finish_streamer()
         if enabled:
             await self._ensure_ask_client()
-        await self._finish_streamer()
         self.ask_mode = enabled
+        self.plan_mode = enabled and plan
         self.turn_prompt_id = None
 
     # ------------------------------------------------------------ ciclo de vida
@@ -169,6 +197,8 @@ class Bridge:
             await self.bot.set_my_commands(
                 [
                     BotCommand("status", "modelo, sessão, contexto, modo"),
+                    BotCommand("plan", "modo plano: só propõe etapas"),
+                    BotCommand("aprovar", "implementa o plano proposto"),
                     BotCommand("ask", "modo só leitura e pesquisa"),
                     BotCommand("work", "volta ao modo normal"),
                     BotCommand("stop", "aborta o turno atual"),
@@ -301,6 +331,9 @@ class Bridge:
         self.turn_prompt_id = None
         if streamer is None or streamer.closed:
             return
+        if self.plan_mode and streamer.full_text.strip():
+            # Guarda o plano proposto para /aprovar mandar ao agente que executa.
+            self.pending_plan = streamer.full_text.strip()
         if state is None:
             try:
                 state = await self._state()
@@ -499,6 +532,10 @@ class Bridge:
                 await self._cmd_status(chat_id)
             elif command == "ask":
                 await self._cmd_ask(chat_id, arg)
+            elif command == "plan":
+                await self._cmd_plan(chat_id, arg)
+            elif command in ("approve", "aprovar"):
+                await self._cmd_approve(chat_id)
             elif command in ("work", "code"):
                 await self._cmd_work(chat_id)
             elif command == "stop":
@@ -552,12 +589,52 @@ class Bridge:
             "/work volta ao modo normal.",
         )
 
+    async def _cmd_plan(self, chat_id: int, arg: str) -> None:
+        """Liga o modo plano: só investiga e propõe etapas, sem tocar em nada."""
+        try:
+            await self._set_ask_mode(True, plan=True)
+        except Exception as exc:
+            await self._send(chat_id, f"❌ não consegui subir o modo plano: {exc}")
+            return
+        if arg:
+            self.pending_plan = None
+            await self._prompt(chat_id, PLAN_INSTRUCTION + arg)
+            return
+        await self._send(
+            chat_id,
+            "📋 modo PLANO ligado: o agente só investiga e propõe etapas — não "
+            "escreve, não edita e não executa.\n\n"
+            f"ferramentas: {PLAN_TOOLS}\n"
+            "Quando o plano estiver pronto: /aprovar para implementar, "
+            "/work para sair sem implementar.",
+        )
+
+    async def _cmd_approve(self, chat_id: int) -> None:
+        """Devolve o plano ao agente que executa, no modo normal."""
+        plan = self.pending_plan
+        if not plan:
+            await self._send(chat_id, "nada para aprovar — use /plan <tarefa> primeiro")
+            return
+        await self._set_ask_mode(False)
+        self.pending_plan = None
+        await self._send(chat_id, "▶️ implementando o plano aprovado…")
+        await self._prompt(
+            chat_id,
+            "Implemente o plano abaixo, na ordem, e verifique cada etapa:\n\n" + plan,
+        )
+
     async def _cmd_work(self, chat_id: int) -> None:
         if not self.ask_mode:
             await self._send(chat_id, "já está no modo normal")
             return
+        was_plan = self.plan_mode
         await self._set_ask_mode(False)
-        await self._send(chat_id, "🛠️ modo normal: o agente pode editar e executar")
+        self.pending_plan = None
+        await self._send(
+            chat_id,
+            "🛠️ modo normal: o agente pode editar e executar"
+            + (" (plano descartado)" if was_plan else ""),
+        )
 
     async def _cmd_status(self, chat_id: int) -> None:
         state = await self._state()
@@ -580,8 +657,15 @@ class Bridge:
         if isinstance(percent, (int, float)):
             lines.append(f"contexto: {round(percent)}%")
         lines.append(f"estado: {status}")
-        lines.append(f"modo: {'🔍 ask (só leitura)' if self.ask_mode else '🛠️ normal'}")
+        lines.append(f"modo: {self._mode_label()}")
         await self._send(chat_id, "\n".join(lines))
+
+    def _mode_label(self) -> str:
+        if self.plan_mode:
+            return "📋 plano (só investiga e propõe)"
+        if self.ask_mode:
+            return "🔍 ask (só leitura)"
+        return "🛠️ normal"
 
     async def _cmd_new(self, chat_id: int) -> None:
         frame = await self._active_client().request({"type": "new_session"}, timeout=120)
@@ -733,6 +817,16 @@ class Bridge:
                 "id": entry["id"],
                 "confirmed": index == 0,
             }
+        elif entry.get("other") == index:
+            # "Other" pede texto livre: o rótulo literal não é resposta válida.
+            self.pending_text[chat_id] = entry["id"]
+            await self._dismiss_ui_message(chat_id, query.message.message_id, True, label)
+            await self._send(
+                chat_id,
+                "✏️ escreva a resposta (ou /cancel para desistir)",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
         else:
             response = {"type": "extension_ui_response", "id": entry["id"], "value": label}
         await self._active_client().send_raw(response)
@@ -821,23 +915,27 @@ class Bridge:
         self, frame: dict[str, Any], options: list[str], *, confirm: bool
     ) -> None:
         token = secrets.token_hex(4)
+        # Opção "Other": o omp espera texto livre, não o rótulo literal.
+        other_index = _find_other_option(options)
         self.pending_ui[token] = {
             "id": frame.get("id"),
             "options": options,
             "confirm": confirm,
+            "other": other_index,
         }
         while len(self.pending_ui) > PENDING_UI_LIMIT:
             oldest = next(iter(self.pending_ui))
             self.pending_ui.pop(oldest, None)
 
         keyboard = [
-            [InlineKeyboardButton(text=o[:60], callback_data=f"ui:{token}:{i}")]
+            [InlineKeyboardButton(text=_button_label(o), callback_data=f"ui:{token}:{i}")]
             for i, o in enumerate(options)
         ]
         title = frame.get("title") or "Confirmação"
-        await self._send(
-            self.chat_id, f"❓ {title}", reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        # O `ask` do omp manda uma descrição por opção; sem ela o usuário vê
+        # rótulos secos e perde o critério de escolha.
+        body = _describe_options(title, options, frame.get("optionDetails"))
+        await self._send(self.chat_id, body, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def _ask_text(self, frame: dict[str, Any]) -> None:
         self.pending_text[self.chat_id] = frame.get("id")
@@ -938,7 +1036,10 @@ class Bridge:
     # ----------------------------------------------------------------- utils
 
     async def _state(self) -> dict[str, Any]:
-        frame = await self._active_client().request({"type": "get_state"})
+        return await self._state_for(self._active_client())
+
+    async def _state_for(self, client: OmpRpcClient) -> dict[str, Any]:
+        frame = await client.request({"type": "get_state"})
         data = frame.get("data")
         return data if isinstance(data, dict) else {}
 
@@ -949,6 +1050,59 @@ class Bridge:
             await asyncio.sleep(_retry_seconds(exc) + 0.5)
             with contextlib.suppress(Exception):
                 await self.bot.send_message(chat_id, text, **kwargs)
+
+
+def _button_label(text: str, limit: int = 40) -> str:
+    """Rótulo curto para o botão (o texto longo vai na mensagem)."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1] + "…"
+
+
+def _find_other_option(options: list[str]) -> int | None:
+    """Índice da opção de texto livre ("Other"), quando existir."""
+    for index, option in enumerate(options):
+        if str(option).strip().lower().startswith("other"):
+            return index
+    return None
+
+
+def _describe_options(
+    title: str, options: list[str], details: Any, limit: int = 200
+) -> str:
+    """Pergunta, com a descrição que o omp manda por opção.
+
+    A lista numerada só aparece quando há descrições (o `ask` do omp): numa
+    aprovação comum os botões já mostram as opções, e repeti-las como
+    "1. Approve / 2. Deny" só polui a mensagem.
+    """
+    descriptions: list[str] = []
+    if isinstance(details, list):
+        for item in details:
+            if isinstance(item, dict):
+                descriptions.append(str(item.get("description") or "").strip())
+            else:
+                descriptions.append("")
+
+    if not any(descriptions):
+        return f"❓ {title}"
+
+    lines = [f"❓ {title}"]
+    for index, option in enumerate(options):
+        description = descriptions[index] if index < len(descriptions) else ""
+        label = _button_label(option, 80)
+        if description:
+            lines.append(f"\n{index + 1}. {label}\n   {_truncate_text(description, limit)}")
+        else:
+            lines.append(f"\n{index + 1}. {label}")
+    return "\n".join(lines)
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _index_of(data: str) -> int | None:

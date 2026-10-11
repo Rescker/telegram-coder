@@ -180,6 +180,234 @@ class CallbackQueryStub:
         return True
 
 
+def test_switching_mode_aborts_the_running_turn(tmp_path: Path) -> None:
+    """Sem abortar, o prompt do novo modo entraria como steer do turno antigo."""
+
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        # O cliente de trabalho está em streaming.
+        bridge.client.responses["get_state"] = {
+            "success": True,
+            "data": {"isStreaming": True},
+        }
+
+        class StubAskClient:
+            def __init__(self) -> None:
+                self.events = asyncio.Queue()
+                self.running = True
+
+            async def start(self) -> None:
+                pass
+
+            async def close(self) -> None:
+                pass
+
+            async def request(self, cmd: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+                return {"success": True, "data": {}}
+
+            async def prompt(self, text: str, **kwargs: Any) -> str:
+                return "p1"
+
+            def forget_prompt(self, prompt_id: str) -> None:
+                pass
+
+        async def fake_ensure() -> Any:
+            client = StubAskClient()
+            bridge.ask_client = client
+            return client
+
+        bridge._ensure_ask_client = fake_ensure  # type: ignore[method-assign]
+
+        await bridge._handle_command(42, "/ask")
+        aborts = [c for c in bridge.client.requests if c["type"] == "abort"]
+        assert aborts, f"o turno em curso deveria ter sido abortado: {bridge.client.requests}"
+
+    asyncio.run(scenario())
+
+
+def test_mode_switch_without_streaming_does_not_abort(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        bridge.client.responses["get_state"] = {
+            "success": True,
+            "data": {"isStreaming": False},
+        }
+
+        class StubAskClient:
+            def __init__(self) -> None:
+                self.events = asyncio.Queue()
+                self.running = True
+
+            async def start(self) -> None:
+                pass
+
+            async def close(self) -> None:
+                pass
+
+            async def request(self, cmd: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+                return {"success": True, "data": {}}
+
+            async def prompt(self, text: str, **kwargs: Any) -> str:
+                return "p1"
+
+            def forget_prompt(self, prompt_id: str) -> None:
+                pass
+
+        async def fake_ensure() -> Any:
+            client = StubAskClient()
+            bridge.ask_client = client
+            return client
+
+        bridge._ensure_ask_client = fake_ensure  # type: ignore[method-assign]
+
+        await bridge._handle_command(42, "/ask")
+        assert not [c for c in bridge.client.requests if c["type"] == "abort"]
+
+    asyncio.run(scenario())
+
+
+def test_option_details_are_shown_in_dialog(tmp_path: Path) -> None:
+    """O `ask` do omp manda uma descrição por opção; sem ela o usuário escolhe no escuro."""
+
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        await bridge._handle_ui_request(
+            {
+                "type": "extension_ui_request",
+                "id": "ui_q",
+                "method": "select",
+                "title": "Qual contrato para `soma`?",
+                "options": ["soma(a, b)", "soma(*numeros)", "Other (type your own)"],
+                "optionDetails": [
+                    {"description": "Dois argumentos, sem type hints."},
+                    {"description": "Variádica, delega para o builtin sum()."},
+                    {},
+                ],
+            }
+        )
+        body = bridge.bot.texts()[0]
+        assert "❓ Qual contrato para `soma`?" in body
+        assert "1. soma(a, b)" in body
+        assert "Dois argumentos, sem type hints." in body
+        assert "2. soma(*numeros)" in body
+        assert "Variádica, delega para o builtin sum()." in body
+        assert "3. Other (type your own)" in body
+
+    asyncio.run(scenario())
+
+
+def test_other_option_asks_for_free_text(tmp_path: Path) -> None:
+    """Escolher "Other" não pode mandar o rótulo literal como resposta."""
+
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        await bridge._handle_ui_request(
+            {
+                "type": "extension_ui_request",
+                "id": "ui_q",
+                "method": "select",
+                "title": "Escolha",
+                "options": ["a", "b", "Other (type your own)"],
+            }
+        )
+        key = next(iter(bridge.pending_ui))
+        await bridge._handle_callback(callback_update(42, f"ui:{key}:2", 1001))
+
+        assert bridge.client.raw == [], "nada deveria ir ao omp ainda"
+        assert bridge.pending_text == {42: "ui_q"}
+        assert "escreva a resposta" in bridge.bot.texts()[-1]
+
+        # O texto digitado é que vira a resposta.
+        await bridge._handle_message(text_update(42, "minha resposta", update_id=9))
+        assert bridge.client.raw[-1] == {
+            "type": "extension_ui_response",
+            "id": "ui_q",
+            "value": "minha resposta",
+        }
+        assert bridge.pending_text == {}
+
+    asyncio.run(scenario())
+
+
+def test_plan_mode_uses_readonly_tools_and_keeps_plan(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        prompts: list[str] = []
+
+        class StubClient:
+            def __init__(self) -> None:
+                self.events = asyncio.Queue()
+                self.running = True
+
+            async def start(self) -> None:
+                pass
+
+            async def close(self) -> None:
+                self.running = False
+
+            async def request(self, cmd: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+                return {"success": True, "data": {"isStreaming": False}}
+
+            async def prompt(self, text: str, **kwargs: Any) -> str:
+                prompts.append(text)
+                return "p1"
+
+            def forget_prompt(self, prompt_id: str) -> None:
+                pass
+
+        async def fake_ensure() -> Any:
+            client = StubClient()
+            bridge.ask_client = client
+            return client
+
+        bridge._ensure_ask_client = fake_ensure  # type: ignore[method-assign]
+
+        await bridge._handle_command(42, "/plan some dois numeros")
+        assert bridge.ask_mode is True
+        assert bridge.plan_mode is True
+        assert prompts and prompts[0].startswith("MODO PLANO")
+        assert "some dois numeros" in prompts[0]
+        assert bridge.streamer is not None
+
+        # O texto do turno vira o plano pendente.
+        bridge.streamer.full_text = "1. criar soma\n2. testar"
+        await bridge._finish_streamer({})
+        assert bridge.pending_plan == "1. criar soma\n2. testar"
+
+        # /aprovar sai do modo e manda o plano ao agente que executa.
+        await bridge._handle_command(42, "/aprovar")
+        assert bridge.ask_mode is False
+        assert bridge.plan_mode is False
+        assert bridge.pending_plan is None
+        assert any(
+            "Implemente o plano abaixo" in p["text"] for p in bridge.client.prompts
+        ), bridge.client.prompts
+        assert "1. criar soma" in bridge.client.prompts[-1]["text"]
+
+    asyncio.run(scenario())
+
+
+def test_approve_without_plan_warns(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        await bridge._handle_command(42, "/aprovar")
+        assert "nada para aprovar" in bridge.bot.texts()[-1]
+
+    asyncio.run(scenario())
+
+
+def test_status_shows_plan_mode(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bridge = make_bridge(tmp_path)
+        bridge.ask_mode = True
+        bridge.plan_mode = True
+        bridge.client.responses["get_state"] = {"success": True, "data": {}}
+        await bridge._handle_command(42, "/status")
+        assert "modo: 📋 plano (só investiga e propõe)" in bridge.bot.texts()[-1]
+
+    asyncio.run(scenario())
+
+
 def test_ask_mode_routes_to_readonly_client(tmp_path: Path) -> None:
     """`/ask` usa um segundo omp com ferramentas só de leitura."""
 
@@ -321,7 +549,8 @@ def test_select_approval_round_trip(tmp_path: Path) -> None:
         }
         await bridge._handle_ui_request(frame)
 
-        assert bridge.bot.texts() == ["❓ Allow tool: bash\nCommand: echo done"]
+        body = bridge.bot.texts()[0]
+        assert body == "❓ Allow tool: bash\nCommand: echo done"
         assert len(bridge.pending_ui) == 1
         key = next(iter(bridge.pending_ui))
         approve_data = bridge.bot.buttons()[0]
@@ -383,7 +612,7 @@ def test_confirm_uses_boolean(tmp_path: Path) -> None:
         await bridge._handle_ui_request(
             {"type": "extension_ui_request", "id": "ui_c", "method": "confirm", "title": "Continuar?"}
         )
-        assert bridge.bot.texts() == ["❓ Continuar?"]
+        assert bridge.bot.texts()[0] == "❓ Continuar?"
         key = next(iter(bridge.pending_ui))
 
         await bridge._handle_callback(callback_update(42, f"ui:{key}:0", 1001))
