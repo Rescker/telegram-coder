@@ -400,6 +400,138 @@ def test_no_empty_activity_message_is_created() -> None:
     asyncio.run(scenario())
 
 
+def todo_frame(phases: list[dict[str, Any]], is_error: bool = False) -> dict[str, Any]:
+    return {
+        "type": "tool_execution_end",
+        "toolName": "todo",
+        "toolCallId": "t1",
+        "isError": is_error,
+        "result": {"details": {"op": "create", "phases": phases}},
+    }
+
+
+PHASES = [
+    {
+        "name": "1. Renomear em util.py",
+        "tasks": [
+            {"content": "Renomear a funcao `dobro` para `triplo`", "status": "completed"},
+            {"content": "Rodar os testes", "status": "in_progress"},
+        ],
+    },
+    {
+        "name": "2. Atualizar chamadores",
+        "tasks": [{"content": "Mapear todo uso via grep", "status": "pending"}],
+    },
+]
+
+
+def test_todo_result_renders_as_readable_plan() -> None:
+    """Antes o plano virava `🔧 todo: {"op": "create", ...}` — JSON cru."""
+
+    async def scenario() -> None:
+        bot = FakeBot()
+        streamer = make_streamer(bot)
+        await streamer.consume(todo_frame(PHASES))
+
+        plan = bot.texts("send_message")[-1]
+        assert plan.startswith("📋 plano · 1/3")
+        assert "1. Renomear em util.py" in plan
+        assert "  ✅ Renomear a funcao `dobro` para `triplo`" in plan
+        assert "  🔄 Rodar os testes" in plan
+        assert "2. Atualizar chamadores" in plan
+        assert "  ⬜ Mapear todo uso via grep" in plan
+
+    asyncio.run(scenario())
+
+
+def test_todo_does_not_leak_raw_json_into_activity() -> None:
+    async def scenario() -> None:
+        bot = FakeBot()
+        streamer = make_streamer(bot)
+        await streamer.consume(
+            {
+                "type": "tool_execution_start",
+                "toolName": "todo",
+                "toolCallId": "t1",
+                "args": {"op": "create", "phases": PHASES},
+                "intent": "Registering plan steps",
+            }
+        )
+        assert streamer.activity_lines == []
+        assert not [t for t in bot.texts("send_message") if "⚙️" in t]
+
+    asyncio.run(scenario())
+
+
+def test_plan_is_updated_in_place_as_steps_complete() -> None:
+    async def scenario() -> None:
+        bot = FakeBot()
+        streamer = make_streamer(bot)
+        await streamer.consume(todo_frame(PHASES))
+
+        done = [
+            {
+                "name": "1. Renomear em util.py",
+                "tasks": [
+                    {"content": "Renomear a funcao `dobro` para `triplo`", "status": "completed"},
+                    {"content": "Rodar os testes", "status": "completed"},
+                ],
+            }
+        ]
+        streamer.last_plan_edit = time.monotonic() - 5
+        streamer._last_chat_write = time.monotonic() - 5
+        await streamer.consume(todo_frame(done))
+
+        ids = {mid for name, mid, _, _ in bot.written if name in ("send_message", "edit_message_text")}
+        assert len(ids) == 1, f"o plano deveria viver numa mensagem só: {ids}"
+        final = final_messages(bot)[-1][1]
+        assert final.startswith("📋 plano · 2/2")
+
+    asyncio.run(scenario())
+
+
+def test_plan_survives_turn_end_without_being_collapsed() -> None:
+    """O plano é entregável do turno: não entra no resumo de ferramentas."""
+
+    async def scenario() -> None:
+        bot = FakeBot()
+        streamer = make_streamer(bot)
+        await streamer.consume(delta("Segue o plano."))
+        await streamer.consume(
+            {"type": "tool_execution_start", "toolName": "read", "toolCallId": "r1"}
+        )
+        await streamer.consume(
+            {"type": "tool_execution_end", "toolName": "read", "toolCallId": "r1"}
+        )
+        await streamer.consume(
+            {"type": "tool_execution_start", "toolName": "todo", "toolCallId": "t1"}
+        )
+        await streamer.consume(todo_frame(PHASES))
+        await streamer.finish({})
+
+        plans = [t for _, _, t, _ in bot.written if t.startswith("📋 plano")]
+        assert plans, "o plano sumiu no fim do turno"
+        assert "✅" in plans[-1]
+        # O `todo` entra na contagem; o conteúdo dele é o plano, não uma linha.
+        summary = [t for _, _, t, _ in bot.written if t.startswith("⚙️")]
+        assert summary and "todo ×1" in summary[-1] and "read ×1" in summary[-1], summary
+
+    asyncio.run(scenario())
+
+
+def test_plan_ignores_malformed_phases() -> None:
+    async def scenario() -> None:
+        bot = FakeBot()
+        streamer = make_streamer(bot)
+        await streamer.consume({"type": "tool_execution_end", "toolName": "todo", "result": {}})
+        await streamer.consume(
+            {"type": "tool_execution_end", "toolName": "todo", "result": {"details": {"phases": []}}}
+        )
+        assert not [t for _, _, t, _ in bot.written if t.startswith("📋 plano")]
+
+    asyncio.run(scenario())
+
+
 def test_chunk_split_prefers_paragraph_boundary() -> None:
     """Cortar no meio de uma tabela deixa a outra metade irreconhecível."""
     from bridge.streamer import _split_chunk
@@ -455,6 +587,33 @@ def test_table_is_not_split_across_messages() -> None:
                 assert "|---" not in text, f"fragmento de tabela cru: {text[:120]!r}"
 
     asyncio.run(scenario())
+
+
+def test_emphasis_never_spans_code_spans() -> None:
+    """`x * 3` e `x * 2` na mesma linha fechavam um itálico dentro dos `<code>`."""
+
+    from bridge.streamer import _to_telegram_html
+
+    out = _to_telegram_html("sugere `x * 3`, mas o corpo é `x * 2`")
+    assert out == "sugere <code>x * 3</code>, mas o corpo é <code>x * 2</code>"
+    assert "<i>" not in out
+    assert_valid_telegram_html(out)
+
+    out = _to_telegram_html("o `a * b` e o `c * d` e **forte**")
+    assert "<code>a * b</code>" in out
+    assert "<code>c * d</code>" in out
+    assert "<b>forte</b>" in out
+    assert_valid_telegram_html(out)
+
+
+def test_markdown_inside_code_stays_literal() -> None:
+    from bridge.streamer import _to_telegram_html
+
+    assert _to_telegram_html("`**nao**` e **sim**") == "<code>**nao**</code> e <b>sim</b>"
+    assert _to_telegram_html("`_x_`") == "<code>_x_</code>"
+    assert _to_telegram_html("```py\nx * y\n```") == (
+        '<pre><code class="language-py">x * y\n</code></pre>'
+    )
 
 
 def test_table_values_keep_their_column_labels() -> None:

@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 ACTIVITY_HEADER = "⚙️ atividade\n"
 ACTIVITY_MAX_LINES = 15
 ACTIVITY_THROTTLE = 2.0
+# O plano muda a cada passo; um intervalo curto mantém o acompanhamento vivo.
+PLAN_THROTTLE = 2.0
 TYPING_INTERVAL = 4.0
 ARG_SUMMARY_LIMIT = 120
 # Telegram: ~1 mensagem por segundo por chat; edições contam no mesmo limite.
@@ -174,7 +176,16 @@ def _to_telegram_html(text: str) -> str:
     )
     escaped = _tables_to_lists(escaped)
 
-    escaped = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", escaped)
+    # Código inline também é intocável: sem isso, `x * 3` e `x * 2` na mesma
+    # linha fechavam um itálico dentro de cada `<code>` (virava `x <i> 3`).
+    codes: list[str] = []
+
+    def stash_code(match: re.Match[str]) -> str:
+        codes.append(match.group(1))
+        return f"\x00C{len(codes) - 1}\x00"
+
+    escaped = re.sub(r"`([^`\n]+)`", stash_code, escaped)
+
     escaped = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", escaped)
     # Itálico depois do negrito, com guardas para não pegar `* item` de lista
@@ -200,6 +211,8 @@ def _to_telegram_html(text: str) -> str:
         escaped,
         flags=re.MULTILINE,
     )
+    for index, code in enumerate(codes):
+        escaped = escaped.replace(f"\x00C{index}\x00", f"<code>{code}</code>")
     for index, (lang, body) in enumerate(blocks):
         escaped = escaped.replace(f"\x00B{index}\x00", _render_code_block(lang, body))
     return escaped
@@ -209,6 +222,51 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "…"
+
+
+# Ferramentas cujo resultado é o plano de trabalho do omp. O `todo` devolve a
+# lista em `result.details.phases` (estruturada) e em `result.content[0].text`
+# (já formatada); a estruturada é a fonte preferida.
+TODO_TOOLS = {"todo", "set_todos"}
+PLAN_HEADER = "📋 plano"
+STATUS_MARKS = {
+    "completed": "✅",
+    "in_progress": "🔄",
+    "pending": "⬜",
+    "blocked": "⛔",
+    "cancelled": "🚫",
+}
+
+
+def _extract_phases(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Fases/tarefas do frame de `todo`, quando houver."""
+    result = frame.get("result")
+    if not isinstance(result, dict):
+        return None
+    details = result.get("details")
+    if isinstance(details, dict):
+        phases = details.get("phases")
+        if isinstance(phases, list) and phases:
+            return [p for p in phases if isinstance(p, dict)]
+    return None
+
+
+def _render_plan(phases: list[dict[str, Any]]) -> str:
+    """Lista de tarefas do plano, com progresso e marcas por status."""
+    tasks = [t for p in phases for t in (p.get("tasks") or []) if isinstance(t, dict)]
+    done = sum(1 for t in tasks if t.get("status") == "completed")
+    lines = [f"{PLAN_HEADER} · {done}/{len(tasks)}"]
+    for phase in phases:
+        name = str(phase.get("name") or "").strip()
+        if name:
+            lines.append(f"\n{name}")
+        for task in phase.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            mark = STATUS_MARKS.get(str(task.get("status")), "⬜")
+            content = str(task.get("content") or "").strip()
+            lines.append(f"  {mark} {content}")
+    return "\n".join(lines)
 
 
 def _split_chunk(text: str, limit: int) -> tuple[str, str]:
@@ -266,6 +324,12 @@ class TurnStreamer:
         self.tool_failures = 0
         self.last_activity_sent = ""
         self.last_activity_edit = 0.0
+        # Mensagem própria para o plano (todo): fica legível e não se mistura
+        # com a linha de atividade, que é passageira.
+        self.plan_msg_id: int | None = None
+        self.plan_text = ""
+        self.last_plan_sent = ""
+        self.last_plan_edit = 0.0
         self._last_chat_write = 0.0
 
         self.error: str | None = None
@@ -292,6 +356,10 @@ class TurnStreamer:
         if ftype == "tool_execution_start":
             name = frame.get("toolName") or "tool"
             self.tool_counts[name] += 1
+            if name in TODO_TOOLS:
+                # O plano tem mensagem própria; não vira linha de atividade nem
+                # despeja os argumentos crus (eram um JSON enorme e ilegível).
+                return
             summary = self._args_summary(frame)
             detail = f"{name}: {summary}" if summary else name
             self._activity_add(f"🔧 {detail}", frame.get("toolCallId"))
@@ -302,6 +370,12 @@ class TurnStreamer:
             name = frame.get("toolName") or "tool"
             if frame.get("isError"):
                 self.tool_failures += 1
+            if name in TODO_TOOLS:
+                phases = _extract_phases(frame)
+                if phases:
+                    self.plan_text = _render_plan(phases)
+                    await self._flush_plan()
+                return
             mark = "✗" if frame.get("isError") else "✓"
             self._activity_complete(frame.get("toolCallId"), f"{mark} {name}")
             await self._flush_activity()
@@ -396,6 +470,12 @@ class TurnStreamer:
             and self._may_write(now, self.last_activity_edit, ACTIVITY_THROTTLE)
         ):
             await self._flush_activity()
+        if (
+            self.plan_text
+            and self.plan_text != self.last_plan_sent
+            and self._may_write(now, self.last_plan_edit, PLAN_THROTTLE)
+        ):
+            await self._flush_plan()
         if now - self._last_typing >= TYPING_INTERVAL:
             self._last_typing = now
             try:
@@ -550,6 +630,29 @@ class TurnStreamer:
         self.last_activity_sent = text
         self.last_activity_edit = self._last_chat_write = time.monotonic()
 
+    async def _flush_plan(self, *, force: bool = False) -> None:
+        """Escreve/edita a mensagem do plano, com o mesmo throttle do chat."""
+        if self.closed or not self.plan_text or self.plan_text == self.last_plan_sent:
+            return
+        now = time.monotonic()
+        if not force and not self._may_write(now, self.last_plan_edit, PLAN_THROTTLE):
+            return
+        if self.plan_msg_id is None:
+            message = await self._call(
+                self.bot.send_message, self.chat_id, self.plan_text
+            )
+            if message is not None:
+                self.plan_msg_id = message.message_id
+        else:
+            await self._call(
+                self.bot.edit_message_text,
+                self.plan_text,
+                chat_id=self.chat_id,
+                message_id=self.plan_msg_id,
+            )
+        self.last_plan_sent = self.plan_text
+        self.last_plan_edit = self._last_chat_write = time.monotonic()
+
     def _activity_summary(self) -> str:
         """Resumo de uma linha: o detalhe ao vivo vira contagem no fim do turno."""
         elapsed = time.monotonic() - self.started_at
@@ -599,6 +702,8 @@ class TurnStreamer:
             return
         state = state or {}
         await self._collapse_activity()
+        # O plano é entregável do turno: fica visível, não entra no resumo.
+        await self._flush_plan(force=True)
         if self.active_msg_id is None and not self.text_buf and self.last_msg_id is not None:
             # O texto terminou exatamente num bloco já fechado: o rodapé vai na
             # última mensagem, em vez de criar um "✅ concluído" solto.
