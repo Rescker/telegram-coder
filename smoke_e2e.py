@@ -476,7 +476,87 @@ async def main() -> int:
         cursor, workmsg = await wait(fake, lambda e: "modo normal" in text_of(e), cursor, 60)
         check("8.5 /work volta ao normal", not bridge.ask_mode, text_of(workmsg))
 
-        # ----------------------------------------------------------- 9) /stop
+        # ----------------------------------------------------------- 9) /plan
+        approvals.enabled = True
+        cursor = fake.count()
+        fake.push_text(CHAT, "/plan")
+        cursor, planmsg = await wait(fake, lambda e: "PLANO ligado" in text_of(e), cursor, 120)
+        check("9.1 /plan liga o modo plano", "PLANO ligado" in text_of(planmsg), text_of(planmsg).splitlines()[0])
+        check(
+            "9.2 plano usa ferramentas só de leitura",
+            bridge.ask_client is not None
+            and any(a.startswith("--tools=") for a in bridge.ask_client.argv),
+            next(
+                (a for a in (bridge.ask_client.argv if bridge.ask_client else []) if a.startswith("--tools=")),
+                "sem --tools",
+            ),
+        )
+
+        # `/plan <tarefa>` já planeja: nada pode ser criado no projeto.
+        cursor = fake.count()
+        fake.push_text(CHAT, "/plan crie um arquivo plano_alvo.txt com o texto plano")
+        cursor, _ = await wait_footer(fake, cursor, 300)
+        check(
+            "9.3 plano não alterou nada no projeto",
+            not (cwd / "plano_alvo.txt").exists(),
+            f"{sorted(p.name for p in cwd.iterdir())}",
+        )
+        check(
+            "9.4 plano capturado para /aprovar",
+            bool(bridge.pending_plan),
+            f"{len(bridge.pending_plan or '')} chars",
+        )
+
+        cursor = fake.count()
+        fake.push_text(CHAT, "/status")
+        cursor, st_plan = await wait(fake, lambda e: "modo:" in text_of(e), cursor, 60)
+        check("9.5 /status mostra o modo plano", "plano" in line_value(text_of(st_plan), "modo:"), line_value(text_of(st_plan), "modo:"))
+
+        cursor = fake.count()
+        fake.push_text(CHAT, "/work")
+        cursor, workmsg2 = await wait(fake, lambda e: "modo normal" in text_of(e), cursor, 60)
+        check("9.6 /work sai do plano", not bridge.plan_mode, text_of(workmsg2))
+        approvals.enabled = False
+
+        # -------------------------------------------- 10) plano do omp (todo)
+        approvals.enabled = True
+        cursor = fake.count()
+        fake.push_text(
+            CHAT,
+            "registre com a ferramenta todo um plano de 2 fases para criar "
+            "etapas.txt e depois crie o arquivo",
+        )
+        cursor, plan_card = await wait(
+            fake, lambda e: text_of(e).startswith("📋 plano"), cursor, 300
+        )
+        check(
+            "10.1 plano do omp virou mensagem legível",
+            "📋 plano ·" in text_of(plan_card) and "✅" in text_of(plan_card) + all_text(fake),
+            text_of(plan_card).splitlines()[0],
+        )
+        cursor, _ = await wait_footer(fake, cursor, 300)
+        approvals.enabled = False
+        plan_texts = [t for t in all_text(fake).split("\n") if t.startswith("📋 plano")]
+        check(
+            "10.2 plano não despeja JSON cru",
+            not any('"op"' in t or '"phases"' in t for t in plan_texts),
+            plan_texts[-1] if plan_texts else "sem plano",
+        )
+        check(
+            "10.3 resumo conta o todo uma vez (sem despejar conteúdo)",
+            "todo ×" in all_text(fake)
+            and '{"op"' not in all_text(fake),
+            next(
+                (
+                    line
+                    for line in all_text(fake).splitlines()
+                    if line.startswith("⚙️") and "×" in line
+                ),
+                "sem resumo",
+            ),
+        )
+
+        # ----------------------------------------------------------- 11) /stop
         approvals.enabled = True
         cursor = fake.count()
         fake.push_text(CHAT, "rode bash: ping -n 20 127.0.0.1")
@@ -490,7 +570,7 @@ async def main() -> int:
         check("8.2 turno encerrado após /stop", not await wait_for_streaming(bridge, 30))
         approvals.enabled = False
 
-        # ------------------------------------------------------- 10) documento
+        # ------------------------------------------------------- 12) documento
         approvals.enabled = True
         cursor = fake.count()
         doc = "relatório de smoke\n" + ("linha de teste\n" * 40)
@@ -507,10 +587,10 @@ async def main() -> int:
             caption="resuma o arquivo em uma linha",
         )
         cursor, _ = await wait_footer(fake, cursor, 300)
-        check("10.1 documento processado (turno concluído)", True)
+        check("12.1 documento processado (turno concluído)", True)
         approvals.enabled = False
 
-        # ----------------------------------------------------------- 11) foto
+        # ----------------------------------------------------------- 13) foto
         approvals.enabled = True
         cursor = fake.count()
         fake.push_text(
@@ -528,10 +608,10 @@ async def main() -> int:
             caption="o que é esta imagem?",
         )
         cursor, _ = await wait_footer(fake, cursor, 300)
-        check("11.1 foto processada (turno concluído)", True)
+        check("13.1 foto processada (turno concluído)", True)
         approvals.enabled = False
 
-        # --------------------------------------------------- 12) allowlist
+        # --------------------------------------------------- 14) allowlist
         with fake.cond:
             fake.updates.append(
                 {
@@ -549,14 +629,14 @@ async def main() -> int:
             fake.cond.notify_all()
         cursor = fake.count()
         cursor, denied = await wait(fake, lambda e: "não autorizado" in text_of(e), cursor, 60)
-        check("12.1 usuário não autorizado recusado", "não autorizado" in text_of(denied))
+        check("14.1 usuário não autorizado recusado", "não autorizado" in text_of(denied))
 
-        # ----------------------------------------------------- 13) offset
-        check("13.1 arquivo de offset gravado", config.offset_file.exists())
+        # ----------------------------------------------------- 15) offset
+        check("15.1 arquivo de offset gravado", config.offset_file.exists())
         if config.offset_file.exists():
             value = json.loads(config.offset_file.read_text(encoding="utf-8")).get("offset")
             check(
-                "13.2 offset persistido após tratar",
+                "15.2 offset persistido após tratar",
                 isinstance(value, int) and value >= fake.next_update_id - 1,
                 f"offset={value} last={fake.next_update_id - 1}",
             )
